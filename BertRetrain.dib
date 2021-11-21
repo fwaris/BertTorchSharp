@@ -1,0 +1,543 @@
+#!markdown
+
+# Text Classification with a Pre-Trained Language Model using .Net
+The purpose of this notebook is to show how to use pre-trained weights from BERT (or other Tensorflow) 'language' model to train a classifier in .Net (specifically F#).
+
+The text classification task is more easily accomplished in Python due to the supportive ecosystem available there. The website [Hugging Face](https://huggingface.co/transformers/) contains 1000's of pre-trained language models that can be easily consumed using tooling supplied by Hugging Face. 
+
+Python however is not the language of choice when it comes to building high-performance applications. To consume language (or other deep learning) models from an application one usually resorts to deploying the model as a service - with attendant cost, security and integration concerns. For a high-performance application, there may be a need to more tightly integrate the model with other application functionality and therefore an embedded model may be required.
+
+This notebook shows how a language model maybe re-trained and used directly from .Net, bypassing the need to deploy the model as a service.
+
+#!markdown
+
+## Load the required packages
+
+#!fsharp
+
+//#r "nuget: libtorch-cpu-win-x64" //this notebook is written to work on CPU also
+#r "nuget: libtorch-cuda-11.3-win-x64, 1.10.0.1" //large package - takes a long time to load and unpack the first time.
+#r "nuget: TorchSharp"
+#r "nuget: TfCheckpoint"   
+#r "nuget: FsBERTTokenizer"
+#r "nuget: FSharp.Data"
+
+#!fsharp
+
+open TfCheckpoint
+open TorchSharp
+
+let device = if torch.cuda.is_available() then torch.CUDA else torch.CPU
+printfn $"torch devices is %A{device}"
+
+#!markdown
+
+## Load weigths from pre-trained BERT 'checkpoint'
+Here the pre-trained weights from the 'small' BERT uncased model are used - downloaded from [Tensorflow Hub](https://tfhub.dev/google/small_bert/bert_uncased_L-2_H-128_A-2/2).
+
+Note: The weights can also be downloaded from Hugging Face, however they are not easily extractable from languages other than Python. Hugging Face creates its own wrapped packages that require Hugging Face tooling to use.
+
+The download includes a folder called 'variables' that contains the pre-trained weights.
+
+#!fsharp
+
+let bertCheckpointFolder = @"C:\s\hack\small_bert_bert_uncased_L-2_H-128_A-2_2\variables"
+let tensors = CheckpointReader.readCheckpoint bertCheckpointFolder |> Seq.toArray
+//show first tensor
+printfn "%A" tensors.[0]
+
+#!markdown
+
+The first tensor is named *"bert/embeddings/LayerNorm/beta"*. It is a float32 array of shape 1x128. 
+
+Note the TfCheckpoint package keeps tensors as flat arrays. These can be reshaped when loading into other Tensor libraries e.g. TorchSharp as shown later.
+
+### List checkpoint tensors
+Below are all the tensor names in the pre-trained 'checkpoint'.
+
+#!fsharp
+
+tensors (* |> Array.skip 20 *) |> Array.map (fun (n,st) -> {|Dims=st.Shape; Name=n|})
+
+#!markdown
+
+## The Small BERT Model
+The small BERT model used here ('small_bert_bert_uncased_L-2_H-128') requries lower cased text and hidden layer size of 128. It has two 'transformer' layers. There are many versions of BERT available - from tiny to large. See the [text classification tutorial](https://www.tensorflow.org/text/tutorials/classify_text_with_bert) from Tensforflow for more details.
+
+We will re-construct the BERT model using TorchSharp (.Net binding to PyTorch) code and then load the pre-trained weights. The weights will have to be mapped manually. This requires some knowledge of [Tranformers/BERT](https://arxiv.org/abs/1810.04805). However, our task is made easier because TorchSharp (PyTorch) provides a pre-built [TransformerEncoderLayer](https://pytorch.org/docs/stable/generated/torch.nn.TransformerEncoderLayer.html) which encapulates the basic structure of Transformer-based models.
+
+We are required to reconstruct the exact structure of BERT layer-by-layer to ensure the weights are applicable. For re-training we may exclude the final layers and only build the model up to the output of the encoder. For our needs, we wil use the pre-trained weights that start with 'bert' (see above) and ignore the rest.
+
+### Bert Layers
+The top level layers we will need are:
+- *Embedding layer*: With sub-layers for word, position & token-type embeddings; layer normalization and dropout. Embedding maps one-hot vectors into corresponding learned feature vectors.
+- *Transfomer Encoder layer*: With two sub-layers that apply the core transformer functionality.
+- *Pooling*: Pools the hidden state of the first token
+
+The rest of the layers will be custom built for text classification.
+
+### Other Parameters
+Additional model parameters are required, e.g. vocabulary size, dropout rate, etc. Some of these maybe obtained from Hugging Face from the [BERT model 'card' config file](https://huggingface.co/bert-base-uncased/blob/main/config.json). Here we have defined the required parameters as constants in the code below.
+
+#!markdown
+
+## Constants
+
+#!fsharp
+
+//tensor dims - these values should match the relevant dimensions of the corresponding tensors in the checkpoint
+let HIDDEN      = 128L
+let VOCAB_SIZE  = 30522L    // see vocab.txt file included in the BERT download
+let TYPE_SIZE   = 2L         // bert needs 'type' of token
+let MAX_POS_EMB = 512L
+
+//other parameters
+let EPS_LAYER_NORM      = 1e-12
+let HIDDEN_DROPOUT_PROB = 0.1
+let N_HEADS             = 2L
+let ATTN_DROPOUT_PROB   = 0.1
+let ENCODER_LAYERS      = 2L
+let ENCODER_ACTIVATION  = torch.nn.Activations.GELU
+
+#!markdown
+
+## Embedding Layer
+
+#!fsharp
+
+//Note: The module and variable names used here match the tensor name 'paths' as delimted by '/' (see above), 
+//for easier matching.
+type BertEmbedding() as this = 
+    inherit torch.nn.Module("embeddings")
+    
+    let word_embeddings         = torch.nn.Embedding(VOCAB_SIZE,HIDDEN,padding_idx=0L)
+    let position_embeddings     = torch.nn.Embedding(MAX_POS_EMB,HIDDEN)
+    let token_type_embeddings   = torch.nn.Embedding(TYPE_SIZE,HIDDEN)
+    let LayerNorm               = torch.nn.LayerNorm([|HIDDEN|],EPS_LAYER_NORM)
+    let dropout                 = torch.nn.Dropout(HIDDEN_DROPOUT_PROB)
+
+    do 
+        this.RegisterComponents()
+
+    member this.forward(input_ids:torch.Tensor, token_type_ids:torch.Tensor, position_ids:torch.Tensor) =   
+    
+        let embeddings =      
+            (input_ids       --> word_embeddings)        +
+            (token_type_ids  --> token_type_embeddings)  +
+            (position_ids    --> position_embeddings)
+
+        embeddings --> LayerNorm --> dropout             // the --> operator works for simple 'forward' invocations
+
+#!markdown
+
+## BERT Pooler
+
+#!fsharp
+
+type BertPooler() as this = 
+    inherit torch.nn.Module("pooler")
+
+    let dense = torch.nn.Linear(HIDDEN,HIDDEN)
+    let activation = torch.nn.Tanh()
+
+    let ``:`` = torch.TensorIndex.Colon
+    let first = torch.TensorIndex.Single(0L)
+
+    do
+        this.RegisterComponents()
+
+    override _.forward (hidden_states) =
+        let first_token_tensor = hidden_states.index(``:``, first) //take first token of the sequence as the pooled value
+        first_token_tensor --> dense --> activation
+
+#!markdown
+
+## BERT Model 
+Combines the embedding, pooler and transformer encoder layers. (The transformer encoders are available out-of-the-box in PyTroch)
+
+#!fsharp
+
+type BertModel() as this =
+    inherit torch.nn.Module("bert")
+
+    let embeddings = new BertEmbedding()
+    let pooler = new BertPooler()
+
+    let encoderLayer = torch.nn.TransformerEncoderLayer(HIDDEN, N_HEADS, MAX_POS_EMB, ATTN_DROPOUT_PROB, activation=ENCODER_ACTIVATION)
+    let encoder = torch.nn.TransformerEncoder(encoderLayer, ENCODER_LAYERS)
+
+    do
+        this.RegisterComponents()
+    
+    member this.forward(input_ids:torch.Tensor, token_type_ids:torch.Tensor, position_ids:torch.Tensor,?mask:torch.Tensor) =
+        let src = embeddings.forward(input_ids, token_type_ids, position_ids)
+        let srcBatchDim2nd = src.permute(1L,0L,2L) //PyTorch transformer requires input as such. See the Transformer docs
+        let encoded = match mask with None -> encoder.forward(srcBatchDim2nd) | Some mask -> encoder.forward(srcBatchDim2nd,mask)
+        let encodedBatchFst = encoded.permute(1L,0L,2L)
+        encodedBatchFst --> pooler
+
+#!markdown
+
+## Create a BERT Model Instance and Load Pre-Trained TF Weights
+The main task here is to find the right mapping between the parameters of the BertModel and those form the Tensorflow BERT checkpoint.
+
+There are several steps involved - first is create an empty model and list all the parameters in the model.
+
+#!fsharp
+
+let testBert = new BertModel()
+//bert.named_modules() 
+testBert.named_parameters() |> Seq.map (fun struct(n,x) -> n,x.shape) |> Seq.iter (printfn "%A")
+
+#!markdown
+
+If we compare the names above to the Tensorflow checkpoint names in the beginning, we can find clues as to how the two may be matched. However this is not straigtforward. We need to build some 'infrastructure' to make this work.
+
+### Tensor data access helpers
+First off are some utility functions to get and set data into PyTorch tensors.
+
+#!fsharp
+
+module Tensor = 
+    //Note: ensure 't matches tensor datatype otherwise ToArray might crash the app (i.e. exception cannot be caught)
+    let private _getData<'t when 't:>ValueType and 't:struct and 't : (new:unit->'t) > (t:torch.Tensor) =
+        let s = t.data<'t>()
+        s.ToArray()
+
+    let getData<'t when 't:>ValueType and 't:struct and 't : (new:unit->'t)>  (t:torch.Tensor) =
+        if t.device_type <> DeviceType.CPU then 
+            //use t1 = t.clone()
+            use t2 = t.cpu()
+            _getData<'t> t2
+        else 
+            _getData<'t> t
+  
+    let setData<'t when 't:>ValueType and 't:struct and 't : (new:unit->'t)> (t:torch.Tensor) (data:'t[]) =
+        if t.device_type = DeviceType.CPU |> not then failwith "tensor has to be on cpu for setData"        
+        let s = t.data<'t>()
+        s.CopyFrom(data,0,0L)
+
+#!markdown
+
+### Name map
+The *nameMap* list is 3-tuple: 1) BertModel parameter name; 2) list of TF tensor names; and 3) post processing indicator. In PyTorch, the encoder layer combines the query/key/value weights into a single parameter; these are separate in Tensorflow and therefore a list is requrired to map correctly.
+
+The post processing indicator (type PostProc) specifies the post processing required for each map entry.
+
+The *nameMap* list names contain wildcards ('#') which will be replaced by a number representing the encoder layer. BERT model versions can have different number of transformer layers. The model here has 2 layers but larger BERT models can have upto 12 layers. The wildcard-based mapping scheme is apt to handle an arbitrary number of layers.
+
+#!fsharp
+
+type PostProc = V | H | T | N
+
+let postProc (ts:torch.Tensor list) = function
+    | V -> torch.vstack(ResizeArray ts)
+    | H -> torch.hstack(ResizeArray ts)
+    | T -> ts.Head.T                  //Linear layer weights need to be transformed. See https://github.com/pytorch/pytorch/issues/2159
+    | N -> ts.Head
+
+let nameMap =
+    [
+        "encoder.layers.#.self_attn.in_proj_weight",["encoder/layer_#/attention/self/query/kernel"; 
+                                                     "encoder/layer_#/attention/self/key/kernel";    
+                                                     "encoder/layer_#/attention/self/value/kernel"],        V
+
+        "encoder.layers.#.self_attn.in_proj_bias",  ["encoder/layer_#/attention/self/query/bias";
+                                                     "encoder/layer_#/attention/self/key/bias"; 
+                                                     "encoder/layer_#/attention/self/value/bias"],          H
+
+        "encoder.layers.#.self_attn.out_proj.weight", ["encoder/layer_#/attention/output/dense/kernel"],    N
+        "encoder.layers.#.self_attn.out_proj.bias",   ["encoder/layer_#/attention/output/dense/bias"],      N
+
+
+        "encoder.layers.#.linear1.weight",          ["encoder/layer_#/intermediate/dense/kernel"],          T
+        "encoder.layers.#.linear1.bias",            ["encoder/layer_#/intermediate/dense/bias"],            N
+
+        "encoder.layers.#.linear2.weight",          ["encoder/layer_#/output/dense/kernel"],                T
+        "encoder.layers.#.linear2.bias",            ["encoder/layer_#/output/dense/bias"],                  N
+
+        "encoder.layers.#.norm1.weight",            ["encoder/layer_#/attention/output/LayerNorm/gamma"],   N
+        "encoder.layers.#.norm1.bias",              ["encoder/layer_#/attention/output/LayerNorm/beta"],    N
+
+        "encoder.layers.#.norm2.weight",            ["encoder/layer_#/output/LayerNorm/gamma"],             N
+        "encoder.layers.#.norm2.bias",              ["encoder/layer_#/output/LayerNorm/beta"],              N
+
+        "embeddings.word_embeddings.weight"         , ["embeddings/word_embeddings"]           , N
+        "embeddings.position_embeddings.weight"     , ["embeddings/position_embeddings"]       , N
+        "embeddings.token_type_embeddings.weight"   , ["embeddings/token_type_embeddings"]     , N
+        "embeddings.LayerNorm.weight"               , ["embeddings/LayerNorm/gamma"]           , N
+        "embeddings.LayerNorm.bias"                 , ["embeddings/LayerNorm/beta"]            , N
+        "pooler.dense.weight"                       , ["pooler/dense/kernel"]                  , T
+        "pooler.dense.bias"                         , ["pooler/dense/bias"]                    , N
+    ]
+
+let PREFIX = "bert"
+let addPrefix (s:string) = $"{PREFIX}/{s}"
+let sub n (s:string) = s.Replace("#",string n)
+let encoderLayers = int ENCODER_LAYERS
+
+#!markdown
+
+### Name map helpers
+Functions to set the parameter values of a PyTorch module from a TF checkpoint and a 'nameMap'
+
+#!fsharp
+
+//create a PyTorch tensor from TF checkpoint tensor data
+let toFloat32Tensor (shpdTnsr:CheckpointReader.ShapedTensor) = 
+    match shpdTnsr.Tensor with
+    | CheckpointReader.TensorData.TdFloat ds -> torch.tensor(ds, dimensions=shpdTnsr.Shape)
+    | _                                      -> failwith "TdFloat expected"
+
+//set the value of a single parameter
+let performMap (tfMap:Map<string,_>) (ptMap:Map<string,Modules.Parameter>) (torchName,tfNames,postProcType) = 
+    let torchParm = ptMap.[torchName]
+    let fromTfWts = tfNames |> List.map (fun n -> tfMap.[n] |> toFloat32Tensor) 
+    let parmTensor = postProc fromTfWts postProcType
+    if torchParm.shape <> parmTensor.shape then failwithf $"Mismatched weights for parameter {torchName}; parm shape: %A{torchParm.shape} vs tensor shape: %A{parmTensor.shape}"
+    Tensor.setData<float32> torchParm (Tensor.getData<float32>(parmTensor))
+
+//set the parameter weights of a PyTorch model given checkpoint and nameMap
+let loadWeights (model:torch.nn.Module) checkpoint encoderLayers nameMap =
+    let tfMap = checkpoint |> Map.ofSeq
+    let ptMap = model.named_parameters() |> Seq.map (fun struct(n,m) -> n,m) |> Map.ofSeq
+
+    //process encoder layers
+    for l in 0 .. encoderLayers - 1 do
+        nameMap
+        |> List.filter (fun (p:string,_,_) -> p.Contains("#")) 
+        |> List.map (fun (p,tns,postProc) -> sub l p, tns |> List.map (addPrefix >> (sub l)), postProc)
+        |> List.iter (performMap tfMap ptMap)
+
+    nameMap
+    |> List.filter (fun (p,_,_) -> p.Contains("#") |> not)
+    |> List.map (fun (name,tns,postProcType) -> name, tns |> List.map addPrefix, postProcType)
+    |> List.iter (performMap tfMap ptMap)
+
+#!markdown
+
+### Load weights into test model instance
+
+#!fsharp
+
+loadWeights testBert tensors (int ENCODER_LAYERS) nameMap
+
+#!markdown
+
+### Quick check
+Do a quick check - print the value of one of the model parameters and compare that to the equivalent one from TF to see if the values look right.
+
+#!fsharp
+
+testBert.get_parameter("encoder.layers.0.self_attn.in_proj_weight") |> Tensor.getData<float32>
+
+#!fsharp
+
+tensors |> Seq.find (fun (n,_) -> n = "bert/encoder/layer_0/attention/self/query/kernel")
+
+#!markdown
+
+## Model Training
+With the pretained weights loaded, the model will be extended for classification (later). The training dataset is the [Yelp review dataset](https://s3.amazonaws.com/fast-ai-nlp/yelp_review_polarity_csv.tgz). Assume this data is saved to a local folder as given below.
+
+#!fsharp
+
+let foldr = @"C:\yelp_review_polarity_csv"
+let testCsv = Path.Combine(foldr,"test.csv")
+let trainCsv = Path.Combine(foldr,"train.csv")
+if File.Exists testCsv |> not then failwith $"File not found; path = {testCsv}"
+printfn "%A" trainCsv
+
+#!markdown
+
+### Load data
+
+#!fsharp
+
+open FSharp.Data
+type YelpCsv = FSharp.Data.CsvProvider< Sample="a,b", HasHeaders=false, Schema="Label,Text">
+type [<CLIMutable>] YelpReview = {Label:int; Text:string}
+//need to make labels 0-based so subtract 1
+let testSet = YelpCsv.Load(testCsv).Rows |> Seq.map (fun r-> {Label=int r.Label - 1; Text=r.Text}) |> Seq.toArray 
+let trainSet = YelpCsv.Load(trainCsv).Rows |> Seq.map (fun r->{Label=int r.Label - 1; Text=r.Text}) |> Seq.toArray
+testSet.Display() 
+
+#!fsharp
+
+let classes = trainSet |> Seq.map (fun x->x.Label) |> set
+classes.Display()
+let TGT_LEN = classes.Count |> int64
+
+#!markdown
+
+### Batch processing
+
+#!fsharp
+
+let BATCH_SIZE = 128
+let trainBatches = trainSet |> Seq.chunkBySize BATCH_SIZE
+let testBatches  = testSet  |> Seq.chunkBySize BATCH_SIZE
+open BERTTokenizer
+let vocabFile = @"C:\s\hack\small_bert_bert_uncased_L-2_H-128_A-2_2\assets\vocab.txt"
+let vocab = Vocabulary.loadFromFile vocabFile
+
+let position_ids = torch.arange(MAX_POS_EMB).expand(int64 BATCH_SIZE,-1L).``to``(device)
+
+//convert a batch to input and output (X, Y) tensors
+let toXY (batch:YelpReview[]) = 
+    let xs = batch |> Array.map (fun x-> Featurizer.toFeatures vocab true (int MAX_POS_EMB) x.Text "")
+    let d_tkns      = xs |> Seq.collect (fun f -> f.InputIds )  |> Seq.toArray
+    let d_tkn_typs  = xs |> Seq.collect (fun f -> f.SegmentIds) |> Seq.toArray
+    let tokenIds = torch.tensor(d_tkns,     dtype=torch.int).view(-1L,MAX_POS_EMB)        
+    let sepIds   = torch.tensor(d_tkn_typs, dtype=torch.int).view(-1L,MAX_POS_EMB)
+    let Y = torch.tensor(batch |> Array.map (fun x->x.Label), dtype=torch.int64).view(-1L)
+    (tokenIds,sepIds),Y
+
+#!markdown
+
+### Quick model check
+Evaluate bert instance with just the first batch of the training data to ensure its can produce the expected output.
+The expected output is a tensor with the shape BATCH_SIZE x HIDDEN.
+
+#!fsharp
+
+testBert.Eval()
+let (_tkns,_seps),_ = trainBatches |> Seq.head |> toXY
+//_tkns.shape
+//_tkns |> Tensor.getData<int64>
+let _testOut = testBert.forward(_tkns,_seps,position_ids.cpu()) //test is on cpu
+_testOut.shape.Display()
+
+#!markdown
+
+### Extend for classification
+Here the PyTorch multi-class classification method is used. The number of classes is only two for this data but the multi-class method is more general and can be easily extended to more than two classes
+
+#!fsharp
+
+type BertClassification() as this = 
+    inherit torch.nn.Module("BertClassification")
+
+    let bert = new BertModel()
+    let proj = torch.nn.Linear(HIDDEN,TGT_LEN)
+
+    do
+        this.RegisterComponents()
+        this.LoadBertPretrained()
+
+    member _.LoadBertPretrained() =
+        loadWeights bert tensors (int ENCODER_LAYERS) nameMap
+    
+    member _.forward(tknIds,sepIds,pstnIds) =
+        use encoded = bert.forward(tknIds,sepIds,pstnIds)
+        encoded --> proj 
+
+#!markdown
+
+## Training and evaluation code
+
+#!fsharp
+
+let _model = new BertClassification()
+_model.``to``(device)
+let _loss = torch.nn.functional.cross_entropy_loss()
+let mutable EPOCHS = 1
+let mutable verbose = true
+let gradCap = 0.1f
+let opt = torch.optim.Adam(_model.parameters (), 0.001, amsgrad=true)       
+
+let class_acc (y:torch.Tensor) (t:torch.Tensor) =
+    use i = y.argmax(1L)
+    let i_t = Tensor.getData<int64>(i)
+    let m_t = Tensor.getData<int64>(t)
+    Seq.zip i_t m_t 
+    |> Seq.map (fun (a,b) -> if a = b then 1.0 else 0.0) 
+    |> Seq.average
+
+//adjustment for end of data when full batch may not be available
+let adjPositions currBatchSize = if int currBatchSize = BATCH_SIZE then position_ids else torch.arange(MAX_POS_EMB).expand(currBatchSize,-1L).``to``(device)
+
+let evaluate e =
+    _model.Eval()
+    let lss =
+        testBatches |> Seq.map toXY
+        |> Seq.mapi
+            (fun i ((tkns,typs), t) ->
+                use tkns = tkns.``to``(device)
+                use typs = typs.``to``(device)
+                use t    = t.``to``(device)            
+                let  pstns = adjPositions tkns.shape.[0]
+                use y = _model.forward(tkns,typs,pstns)
+                use loss = _loss.Invoke(y, t)
+                let ls = loss.ToDouble()
+                let acc = class_acc y t
+                tkns.Dispose()
+                typs.Dispose()
+                t.Dispose()
+                GC.Collect();
+                ls,acc)
+        |> Seq.toArray
+    let ls = lss |> Seq.averageBy fst
+    let acc = lss |> Seq.averageBy snd
+    ls,acc
+
+let mutable e = 0
+let mutable go = true
+
+let train () =
+    let gradMin,gradMax = (-gradCap).ToScalar(),  gradCap.ToScalar()
+    while go && e < EPOCHS do
+        e <- e + 1
+        //for e = 1 to EPOCHS do
+        _model.Train()
+        let losses = 
+            trainBatches 
+            |> Seq.map toXY
+            |> Seq.mapi (fun i (x, t) -> i, x, t)
+            |> Seq.choose
+                (fun (i, (tkns,typs), t) ->
+                    if go then
+                        opt.zero_grad ()                          
+                        use tkns = tkns.``to``(device)
+                        use typs = typs.``to``(device)
+                        use t    = t.``to``(device)
+                        let  pstns = adjPositions tkns.shape.[0]                        
+                        use y'= _model.forward(tkns,typs,pstns)
+                        use loss = _loss.Invoke(y',t)                           
+                        loss.backward()
+                        _model.parameters() |> Array.iter (fun t -> t.grad().clip(gradMin,gradMax) |> ignore)                            
+                        use  t_opt = opt.step ()
+                        let ls = float loss
+                        if verbose && i % 100 = 0 then
+                            GC.Collect();
+                            let acc = class_acc y' t
+                            printfn $"Epoch: {e}, minibatch: {i}, ce: {ls}, accuracy: {acc}"                            
+                        Some ls
+                    else
+                        None)
+            |> Seq.toArray
+
+        if go then
+            let evalCE,evalAcc = evaluate e
+            printfn $"Epoch {e} train: {Seq.average losses}; eval acc: {evalAcc}"
+
+    printfn "Done train"
+
+let runner () = async { do train () } 
+
+#!markdown
+
+### Run training
+
+#!fsharp
+
+runner() |> Async.RunSynchronously
+(*
+    go <- false //eval to stop early  - only works when running async
+
+sample output:
+...
+Epoch: 2, minibatch: 4200, ce: 0.14490307867527008, accuracy: 0.9375
+Epoch: 2, minibatch: 4300, ce: 0.04636668041348457, accuracy: 0.984375
+Epoch 2 train: 0.15354100534277304; eval acc: 0.9376728595478595
+*)
