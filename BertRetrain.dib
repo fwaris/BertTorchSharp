@@ -1,7 +1,7 @@
 #!markdown
 
 # Text Classification with a Pre-Trained Language Model using .Net
-The purpose of this notebook is to show how to use pre-trained weights from BERT (or other Tensorflow) 'language' model to train a classifier in .Net (specifically F#).
+The purpose of this notebook is to show how to use pre-trained weights from BERT (or another Tensorflow) 'language' model to train a classifier in .Net (specifically F#).
 
 The text classification task is more easily accomplished in Python due to the supportive ecosystem available there. The website [Hugging Face](https://huggingface.co/transformers/) contains 1000's of pre-trained language models that can be easily consumed using tooling supplied by Hugging Face. 
 
@@ -48,12 +48,12 @@ printfn "%A" tensors.[0]
 
 #!markdown
 
-The first tensor is named *"bert/embeddings/LayerNorm/beta"*. It is a float32 array of shape 1x128. 
+In the above output, the first tensor is named *"bert/embeddings/LayerNorm/beta"*. It is a float32 array of shape 1x128. 
 
 Note the TfCheckpoint package keeps tensors as flat arrays. These can be reshaped when loading into other Tensor libraries e.g. TorchSharp as shown later.
 
 ### List checkpoint tensors
-Below are all the tensor names in the pre-trained 'checkpoint'.
+Below are all the tensor names in the pre-trained BERT checkpoint.
 
 #!fsharp
 
@@ -62,19 +62,19 @@ tensors (* |> Array.skip 20 *) |> Array.map (fun (n,st) -> {|Dims=st.Shape; Name
 #!markdown
 
 ## The Small BERT Model
-The small BERT model used here ('small_bert_bert_uncased_L-2_H-128') requries lower cased text and hidden layer size of 128. It has two 'transformer' layers. There are many versions of BERT available - from tiny to large. See the [text classification tutorial](https://www.tensorflow.org/text/tutorials/classify_text_with_bert) from Tensforflow for more details.
+The small BERT model used here ('small_bert_bert_uncased_L-2_H-128') requries lower cased text and has hidden layer size of 128. It has two 'transformer' layers. There are many versions of BERT available - from tiny to large. See the [text classification tutorial](https://www.tensorflow.org/text/tutorials/classify_text_with_bert) from Tensforflow for more details.
 
 We will re-construct the BERT model using TorchSharp (.Net binding to PyTorch) code and then load the pre-trained weights. The weights will have to be mapped manually. This requires some knowledge of [Tranformers/BERT](https://arxiv.org/abs/1810.04805). However, our task is made easier because TorchSharp (PyTorch) provides a pre-built [TransformerEncoderLayer](https://pytorch.org/docs/stable/generated/torch.nn.TransformerEncoderLayer.html) which encapulates the basic structure of Transformer-based models.
 
-We are required to reconstruct the exact structure of BERT layer-by-layer to ensure the weights are applicable. For re-training we may exclude the final layers and only build the model up to the output of the encoder. For our needs, we wil use the pre-trained weights that start with 'bert' (see above) and ignore the rest.
+We are required to reconstruct the exact structure of BERT layer-by-layer to ensure the weights are applicable. For re-training we may exclude the final layers and only build the model up to the output of the encoder. For our needs, we wil use the pre-trained weights that start with 'bert/' prefix (see above) and ignore the rest.
 
 ### Bert Layers
 The top level layers we will need are:
-- *Embedding layer*: With sub-layers for word, position & token-type embeddings; layer normalization and dropout. Embedding maps one-hot vectors into corresponding learned feature vectors.
+- *Embedding layer*: With sub-layers for word, position & token-type embeddings; layer normalization and dropout. Embedding maps an index to its corresponding learned feature vector.
 - *Transfomer Encoder layer*: With two sub-layers that apply the core transformer functionality.
-- *Pooling*: Pools the hidden state of the first token
+- *Pooling*: Pools (summarizes) the output sequence into a single value - its encoded representation
 
-The rest of the layers will be custom built for text classification.
+The rest of the layers will be custom built for text classification (later).
 
 ### Other Parameters
 Additional model parameters are required, e.g. vocabulary size, dropout rate, etc. Some of these maybe obtained from Hugging Face from the [BERT model 'card' config file](https://huggingface.co/bert-base-uncased/blob/main/config.json). Here we have defined the required parameters as constants in the code below.
@@ -105,7 +105,7 @@ let ENCODER_ACTIVATION  = torch.nn.Activations.GELU
 
 #!fsharp
 
-//Note: The module and variable names used here match the tensor name 'paths' as delimted by '/' (see above), 
+//Note: The module and variable names used here match the tensor name 'paths' as delimted by '/' for TF (see above), 
 //for easier matching.
 type BertEmbedding() as this = 
     inherit torch.nn.Module("embeddings")
@@ -178,7 +178,7 @@ type BertModel() as this =
 
 #!markdown
 
-## Create a BERT Model Instance and Load Pre-Trained TF Weights
+## Create a Test BERT Model Instance and Load Pre-Trained TF Weights
 The main task here is to find the right mapping between the parameters of the BertModel and those form the Tensorflow BERT checkpoint.
 
 There are several steps involved - first is create an empty model and list all the parameters in the model.
@@ -220,9 +220,14 @@ module Tensor =
 #!markdown
 
 ### Name map
-The *nameMap* list is 3-tuple: 1) BertModel parameter name; 2) list of TF tensor names; and 3) post processing indicator. In PyTorch, the encoder layer combines the query/key/value weights into a single parameter; these are separate in Tensorflow and therefore a list is requrired to map correctly.
+The *nameMap* is a 3-tuple list: 
+1. BertModel parameter name; 
+2. List of TF tensor names that should be mapped to the parameter
+3. Post processing indicator. 
+    
+In PyTorch, the encoder layer combines the query/key/value weights into a single parameter; these are separate in Tensorflow and therefore a list is requrired to map correctly.
 
-The post processing indicator (type PostProc) specifies the post processing required for each map entry.
+The post processing indicator (type **PostProc**) specifies the post processing required for each map entry.
 
 The *nameMap* list names contain wildcards ('#') which will be replaced by a number representing the encoder layer. BERT model versions can have different number of transformer layers. The model here has 2 layers but larger BERT models can have upto 12 layers. The wildcard-based mapping scheme is apt to handle an arbitrary number of layers.
 
@@ -274,7 +279,6 @@ let nameMap =
 let PREFIX = "bert"
 let addPrefix (s:string) = $"{PREFIX}/{s}"
 let sub n (s:string) = s.Replace("#",string n)
-let encoderLayers = int ENCODER_LAYERS
 
 #!markdown
 
@@ -337,8 +341,8 @@ tensors |> Seq.find (fun (n,_) -> n = "bert/encoder/layer_0/attention/self/query
 
 #!markdown
 
-## Model Training
-With the pretained weights loaded, the model will be extended for classification (later). The training dataset is the [Yelp review dataset](https://s3.amazonaws.com/fast-ai-nlp/yelp_review_polarity_csv.tgz). Assume this data is saved to a local folder as given below.
+## Training Data
+The training dataset is the [Yelp review dataset](https://s3.amazonaws.com/fast-ai-nlp/yelp_review_polarity_csv.tgz). Assume this data is saved to a local folder as given below.
 
 #!fsharp
 
@@ -362,6 +366,10 @@ let testSet = YelpCsv.Load(testCsv).Rows |> Seq.map (fun r-> {Label=int r.Label 
 let trainSet = YelpCsv.Load(trainCsv).Rows |> Seq.map (fun r->{Label=int r.Label - 1; Text=r.Text}) |> Seq.toArray
 testSet.Display() 
 
+#!markdown
+
+### Calculate the number of label classes
+
 #!fsharp
 
 let classes = trainSet |> Seq.map (fun x->x.Label) |> set
@@ -371,6 +379,7 @@ let TGT_LEN = classes.Count |> int64
 #!markdown
 
 ### Batch processing
+Helpers for serving minibatches of tensors for training and evaluation
 
 #!fsharp
 
@@ -444,12 +453,13 @@ let _loss = torch.nn.functional.cross_entropy_loss()
 let mutable EPOCHS = 1
 let mutable verbose = true
 let gradCap = 0.1f
+let gradMin,gradMax = (-gradCap).ToScalar(),  gradCap.ToScalar()
 let opt = torch.optim.Adam(_model.parameters (), 0.001, amsgrad=true)       
 
-let class_acc (y:torch.Tensor) (t:torch.Tensor) =
-    use i = y.argmax(1L)
+let class_accuracy (y:torch.Tensor) (y':torch.Tensor) =
+    use i = y'.argmax(1L)
     let i_t = Tensor.getData<int64>(i)
-    let m_t = Tensor.getData<int64>(t)
+    let m_t = Tensor.getData<int64>(y)
     Seq.zip i_t m_t 
     |> Seq.map (fun (a,b) -> if a = b then 1.0 else 0.0) 
     |> Seq.average
@@ -457,69 +467,64 @@ let class_acc (y:torch.Tensor) (t:torch.Tensor) =
 //adjustment for end of data when full batch may not be available
 let adjPositions currBatchSize = if int currBatchSize = BATCH_SIZE then position_ids else torch.arange(MAX_POS_EMB).expand(currBatchSize,-1L).``to``(device)
 
+let dispose ls = ls |> List.iter (fun (x:IDisposable) -> x.Dispose())
+
+//run a batch through the model; return true output, predicted output and loss tensors
+let processBatch ((tkns:torch.Tensor,typs:torch.Tensor), y:torch.Tensor) =
+    use tkns_d = tkns.``to``(device)
+    use typs_d = typs.``to``(device)
+    let y_d    = y.``to``(device)            
+    let pstns  = adjPositions tkns.shape.[0]
+    if device <> torch.CPU then //these were copied so ok to dispose old tensors
+        dispose [tkns; typs; y]
+    let y' = _model.forward(tkns_d,typs_d,pstns)
+    let loss = _loss.Invoke(y', y_d)   
+    y_d,y',loss
+
+//evaluate on test set; return cross-entropy loss and classification accuracy
 let evaluate e =
     _model.Eval()
     let lss =
-        testBatches |> Seq.map toXY
-        |> Seq.mapi
-            (fun i ((tkns,typs), t) ->
-                use tkns = tkns.``to``(device)
-                use typs = typs.``to``(device)
-                use t    = t.``to``(device)            
-                let  pstns = adjPositions tkns.shape.[0]
-                use y = _model.forward(tkns,typs,pstns)
-                use loss = _loss.Invoke(y, t)
-                let ls = loss.ToDouble()
-                let acc = class_acc y t
-                tkns.Dispose()
-                typs.Dispose()
-                t.Dispose()
-                GC.Collect();
-                ls,acc)
+        testBatches 
+        |> Seq.map toXY
+        |> Seq.map (fun batch ->
+            let y,y',loss = processBatch batch
+            let ls = loss.ToDouble()
+            let acc = class_accuracy y y'            
+            dispose [y;y';loss]
+            GC.Collect()
+            ls,acc)
         |> Seq.toArray
-    let ls = lss |> Seq.averageBy fst
+    let ls  = lss |> Seq.averageBy fst
     let acc = lss |> Seq.averageBy snd
     ls,acc
 
 let mutable e = 0
-let mutable go = true
-
 let train () =
-    let gradMin,gradMax = (-gradCap).ToScalar(),  gradCap.ToScalar()
-    while go && e < EPOCHS do
+    
+    while e < EPOCHS do
         e <- e + 1
-        //for e = 1 to EPOCHS do
         _model.Train()
         let losses = 
             trainBatches 
             |> Seq.map toXY
-            |> Seq.mapi (fun i (x, t) -> i, x, t)
-            |> Seq.choose
-                (fun (i, (tkns,typs), t) ->
-                    if go then
-                        opt.zero_grad ()                          
-                        use tkns = tkns.``to``(device)
-                        use typs = typs.``to``(device)
-                        use t    = t.``to``(device)
-                        let  pstns = adjPositions tkns.shape.[0]                        
-                        use y'= _model.forward(tkns,typs,pstns)
-                        use loss = _loss.Invoke(y',t)                           
-                        loss.backward()
-                        _model.parameters() |> Array.iter (fun t -> t.grad().clip(gradMin,gradMax) |> ignore)                            
-                        use  t_opt = opt.step ()
-                        let ls = float loss
-                        if verbose && i % 100 = 0 then
-                            GC.Collect();
-                            let acc = class_acc y' t
-                            printfn $"Epoch: {e}, minibatch: {i}, ce: {ls}, accuracy: {acc}"                            
-                        Some ls
-                    else
-                        None)
+            |> Seq.mapi (fun i batch ->                 
+                opt.zero_grad ()   
+                let y,y',loss = processBatch batch
+                let ls = loss.ToDouble()  
+                loss.backward()
+                _model.parameters() |> Array.iter (fun t -> t.grad().clip(gradMin,gradMax) |> ignore)                            
+                use  t_opt = opt.step ()
+                if verbose && i % 100 = 0 then
+                    let acc = class_accuracy y y'
+                    printfn $"Epoch: {e}, minibatch: {i}, ce: {ls}, accuracy: {acc}"                            
+                dispose [y;y';loss]
+                GC.Collect()
+                ls)
             |> Seq.toArray
 
-        if go then
-            let evalCE,evalAcc = evaluate e
-            printfn $"Epoch {e} train: {Seq.average losses}; eval acc: {evalAcc}"
+        let evalCE,evalAcc = evaluate e
+        printfn $"Epoch {e} train: {Seq.average losses}; eval acc: {evalAcc}"
 
     printfn "Done train"
 
@@ -533,7 +538,6 @@ let runner () = async { do train () }
 
 runner() |> Async.RunSynchronously
 (*
-    go <- false //eval to stop early  - only works when running async
 
 sample output:
 ...
