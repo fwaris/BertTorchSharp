@@ -15,8 +15,8 @@ This notebook shows how a language model maybe re-trained and used directly from
 
 #!fsharp
 
-//#r "nuget: libtorch-cpu-win-x64" //this notebook is written to work on CPU also
-#r "nuget: libtorch-cuda-11.3-win-x64, 1.10.0.1" //large package - takes a long time to load and unpack the first time.
+//#r "nuget: torchsharp-cpu" //for cpu
+#r "nuget: torchsharp-cuda-windows" //for gpu
 #r "nuget: TorchSharp"
 #r "nuget: TfCheckpoint"   
 #r "nuget: FsBERTTokenizer"
@@ -27,7 +27,7 @@ This notebook shows how a language model maybe re-trained and used directly from
 open TfCheckpoint
 open TorchSharp
 
-let device = if torch.cuda.is_available() then torch.CUDA else torch.CPU
+let device = if torch.cuda_is_available() then torch.CUDA else torch.CPU
 printfn $"torch devices is %A{device}"
 
 #!markdown
@@ -41,7 +41,7 @@ The download includes a folder called 'variables' that contains the pre-trained 
 
 #!fsharp
 
-let bertCheckpointFolder = @"C:\s\hack\small_bert_bert_uncased_L-2_H-128_A-2_2\variables"
+let bertCheckpointFolder = @"C:\temp\bert\variables"
 let tensors = CheckpointReader.readCheckpoint bertCheckpointFolder |> Seq.toArray
 //show first tensor
 printfn "%A" tensors.[0]
@@ -135,7 +135,7 @@ type BertEmbedding() as this =
 #!fsharp
 
 type BertPooler() as this = 
-    inherit torch.nn.Module("pooler")
+    inherit torch.nn.Module<torch.Tensor,torch.Tensor>("pooler")
 
     let dense = torch.nn.Linear(HIDDEN,HIDDEN)
     let activation = torch.nn.Tanh()
@@ -346,7 +346,7 @@ The training dataset is the [Yelp review dataset](https://s3.amazonaws.com/fast-
 
 #!fsharp
 
-let foldr = @"C:\yelp_review_polarity_csv"
+let foldr = @"C:\temp\yelp_review_polarity_csv\yelp_review_polarity_csv"
 let testCsv = Path.Combine(foldr,"test.csv")
 let trainCsv = Path.Combine(foldr,"train.csv")
 if File.Exists testCsv |> not then failwith $"File not found; path = {testCsv}"
@@ -387,7 +387,7 @@ let BATCH_SIZE = 128
 let trainBatches = trainSet |> Seq.chunkBySize BATCH_SIZE
 let testBatches  = testSet  |> Seq.chunkBySize BATCH_SIZE
 open BERTTokenizer
-let vocabFile = @"C:\s\hack\small_bert_bert_uncased_L-2_H-128_A-2_2\assets\vocab.txt"
+let vocabFile = @"C:\temp\bert\assets\vocab.txt"
 let vocab = Vocabulary.loadFromFile vocabFile
 
 let position_ids = torch.arange(MAX_POS_EMB).expand(int64 BATCH_SIZE,-1L).``to``(device)
@@ -410,7 +410,7 @@ The expected output is a tensor with the shape BATCH_SIZE x HIDDEN.
 
 #!fsharp
 
-testBert.Eval()
+testBert.eval()
 let (_tkns,_seps),_ = trainBatches |> Seq.head |> toXY
 //_tkns.shape
 //_tkns |> Tensor.getData<int64>
@@ -449,7 +449,7 @@ type BertClassification() as this =
 
 let _model = new BertClassification()
 _model.``to``(device)
-let _loss = torch.nn.functional.cross_entropy_loss()
+let _loss = torch.nn.CrossEntropyLoss()
 let mutable EPOCHS = 1
 let mutable verbose = true
 let gradCap = 0.1f
@@ -478,12 +478,12 @@ let processBatch ((tkns:torch.Tensor,typs:torch.Tensor), y:torch.Tensor) =
     if device <> torch.CPU then //these were copied so ok to dispose old tensors
         dispose [tkns; typs; y]
     let y' = _model.forward(tkns_d,typs_d,pstns)
-    let loss = _loss.Invoke(y', y_d)   
+    let loss = _loss.forward(y', y_d)   
     y_d,y',loss
 
 //evaluate on test set; return cross-entropy loss and classification accuracy
 let evaluate e =
-    _model.Eval()
+    _model.eval()
     let lss =
         testBatches 
         |> Seq.map toXY
@@ -504,7 +504,7 @@ let train () =
     
     while e < EPOCHS do
         e <- e + 1
-        _model.Train()
+        _model.train()
         let losses = 
             trainBatches 
             |> Seq.map toXY
@@ -513,7 +513,7 @@ let train () =
                 let y,y',loss = processBatch batch
                 let ls = loss.ToDouble()  
                 loss.backward()
-                _model.parameters() |> Array.iter (fun t -> t.grad().clip(gradMin,gradMax) |> ignore)                            
+                _model.parameters() |> Seq.iter (fun t -> t.grad().clip(gradMin,gradMax) |> ignore)                            
                 use  t_opt = opt.step ()
                 if verbose && i % 100 = 0 then
                     let acc = class_accuracy y y'
